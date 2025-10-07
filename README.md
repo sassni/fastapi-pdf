@@ -142,14 +142,9 @@ If the key is correct, you’ll receive a 200 OK response and the PDF will be ge
 
 ## Testing with Postman
 
-Open Postman → New Request.
-
-Method: POST
-
-URL: http://127.0.0.1:8000/generate-pdf
-
-Body → raw → JSON → paste request JSON.
-
-Click Send → see JSON response with download_url.
-
+1. Open Postman → New Request.
+2. Method: POST
+3. URL: http://127.0.0.1:8000/generate-pdf
+4. Body → raw → JSON → paste request JSON.
+5. Click Send → see JSON response with download_url.
 Try http://127.0.0.1:8000/download-pdf with Send and Download to save the PDF directly.
