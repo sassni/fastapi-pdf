@@ -73,11 +73,15 @@ uvicorn main:app --reload
 
 ## API Endpoint
 ### URL
+```
 POST /generate-pdf
+```
 
 ### Headers
+```
 Content-Type: application/json
 X-API-KEY: your_secret_key_here
+```
 
 ## Example Requests
 ### /generate-pdf (save + return URL)
