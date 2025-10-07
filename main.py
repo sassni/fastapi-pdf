@@ -3,21 +3,33 @@ import logging
 import os
 import re
 import uuid
+import hmac
+from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+# FastAPI imports
+from fastapi import FastAPI, HTTPException, Header, Depends, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, validator
+
+# ReportLab for PDF generation
 from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfgen.canvas import Canvas
-from fastapi.responses import FileResponse
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.graphics.shapes import Drawing
 from reportlab.graphics.charts.barcharts import VerticalBarChart
+
+# Add metadatas
+from PyPDF2 import PdfReader, PdfWriter
+
+from dotenv import load_dotenv
+
+# Load .env file
+load_dotenv()
 
 # Configuration & Logging
 OUTPUT_DIR = "output"
@@ -31,7 +43,7 @@ logger = logging.getLogger("fastapi-pdf")
 
 app = FastAPI(
     title="PDF Generator API",
-    description="Accept JSON, validate, generate a simple PDF and save it locally.",
+    description="Accept JSON, validate, require X-API-KEY, generate PDF and save locally or return file.",
     version="1.0.0",
 )
 
@@ -85,7 +97,7 @@ def make_safe_filename(requested: Optional[str], base_name: str) -> str:
     return f"{name_clean}_{uuid.uuid4().hex[:8]}.pdf"
 
 
-def generate_pdf_file(payload: PDFRequest, output_path: str, logo_path: str = None) -> None:
+def generate_pdf_file(payload: PDFRequest, output_path: str, logo_path: Optional[str] = None) -> None:
     try:
         # Create PDF document
         doc = SimpleDocTemplate(output_path, pagesize=LETTER)
@@ -96,9 +108,9 @@ def generate_pdf_file(payload: PDFRequest, output_path: str, logo_path: str = No
         story.append(Paragraph("Generated Report", styles["Title"]))
         story.append(Spacer(1, 12))
 
-        # Optional logo
+        # Logo
         if logo_path and os.path.exists(logo_path):
-            img = Image(logo_path, width=120, height=60)  # adjust size as needed
+            img = Image(logo_path, width=120, height=60)
             story.append(img)
             story.append(Spacer(1, 12))
 
@@ -135,7 +147,7 @@ def generate_pdf_file(payload: PDFRequest, output_path: str, logo_path: str = No
         bc.strokeColor = colors.black
         bc.valueAxis.valueMin = 0
         bc.valueAxis.valueMax = max(payload.score1, payload.score2) + 10
-        bc.valueAxis.valueStep = 10
+        bc.valueAxis.valueStep = max(1, (int(bc.valueAxis.valueMax) // 5))
         bc.categoryAxis.categoryNames = ["Score 1", "Score 2"]
         bc.categoryAxis.labels.boxAnchor = "ne"
         bc.barWidth = 20
@@ -146,9 +158,6 @@ def generate_pdf_file(payload: PDFRequest, output_path: str, logo_path: str = No
         # Build PDF
         doc.build(story)
 
-        # Add metadata
-        from reportlab.pdfgen import canvas
-        from PyPDF2 import PdfReader, PdfWriter  # requires pip install PyPDF2
 
         # Re-open to add metadata
         reader = PdfReader(output_path)
@@ -159,25 +168,72 @@ def generate_pdf_file(payload: PDFRequest, output_path: str, logo_path: str = No
         writer.add_metadata({
             "/Title": "User Report",
             "/Author": "FastAPI PDF Generator",
-            "/Subject": "Generated PDF with user data, table, and chart",
+            "/Subject": "Generated PDF with user data",
         })
 
         with open(output_path, "wb") as f_out:
             writer.write(f_out)
 
     except Exception as exc:
-        logger.exception("PDF generation error")
+        logger.exception("PDF generation error: %s", exc)
         raise RuntimeError(f"Failed to create PDF: {exc}") from exc
 
-# New endpoint: return FileResponse
-@app.post("/download-pdf")
-async def download_pdf_endpoint(payload: PDFRequest):
+# API key verification dependency
+def verify_api_key(x_api_key: Optional[str] = Header(None)):
+
+    expected = os.getenv("API_KEY")
+    if not expected:
+        logger.error("API_KEY is not set in environment.")
+        raise HTTPException(status_code=500, detail="Server misconfiguration: API key not configured")
+
+    if x_api_key is None:
+        logger.warning("Missing X-API-KEY header")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: missing API key")
+
+    # Use constant-time compare for safety
+    if not hmac.compare_digest(x_api_key, expected):
+        logger.warning("Invalid X-API-KEY provided")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: invalid API key")
+
+    return True
+
+# Exception handler for validation errors
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc: RequestValidationError):
+    errors = []
+    for err in exc.errors():
+        errors.append({"loc": err.get("loc", []), "msg": err.get("msg", ""), "type": err.get("type", "")})
+    return JSONResponse(status_code=422, content={"detail": "Input validation error", "errors": errors})
+
+# Endpoints
+@app.post("/generate-pdf")
+async def generate_pdf_endpoint(payload: PDFRequest, authorized: bool = Depends(verify_api_key)):
     try:
         filename = make_safe_filename(payload.filename, payload.name)
         output_path = os.path.join(OUTPUT_DIR, filename)
 
-        # Optional: specify your own logo path here (png/jpg)
-        logo_path = "logo.png"  # place a logo.png in the same folder
+        logger.info("Generating PDF for %s -> %s", payload.name, output_path)
+        generate_pdf_file(payload, output_path, logo_path="logo.png")
+
+        download_url = f"/{OUTPUT_DIR}/{filename}"
+        logger.info("PDF generation completed: %s", output_path)
+
+        return {"success": True, "file_path": output_path, "download_url": download_url}
+    except RuntimeError as rte:
+        logger.error("Runtime error while generating PDF: %s", rte)
+        raise HTTPException(status_code=500, detail=str(rte))
+    except Exception as exc:
+        logger.exception("Unexpected error in /generate-pdf")
+        raise HTTPException(status_code=500, detail="Unexpected server error") from exc
+
+# New endpoint: return FileResponse
+@app.post("/download-pdf")
+async def download_pdf_endpoint(payload: PDFRequest, authorized: bool = Depends(verify_api_key)):
+    try:
+        filename = make_safe_filename(payload.filename, payload.name)
+        output_path = os.path.join(OUTPUT_DIR, filename)
+
+        logo_path = "logo.png"
         generate_pdf_file(payload, output_path, logo_path=logo_path)
 
         logger.info("PDF ready for download: %s", output_path)
@@ -189,39 +245,6 @@ async def download_pdf_endpoint(payload: PDFRequest):
     except Exception as exc:
         logger.exception("Error in /download-pdf")
         raise HTTPException(status_code=500, detail=f"Could not generate PDF: {exc}")
-
-
-# Exception handler to return clean validation errors
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request, exc: RequestValidationError):
-    errors = []
-    for err in exc.errors():
-        errors.append({"loc": err.get("loc", []), "msg": err.get("msg", ""), "type": err.get("type", "")})
-    return JSONResponse(status_code=422, content={"detail": "Input validation error", "errors": errors})
-
-
-# Endpoints
-@app.post("/generate-pdf")
-async def generate_pdf_endpoint(payload: PDFRequest):
-    try:
-        filename = make_safe_filename(payload.filename, payload.name)
-        output_path = os.path.join(OUTPUT_DIR, filename)
-
-        logger.info("Generating PDF for %s -> %s", payload.name, output_path)
-        generate_pdf_file(payload, output_path)
-
-        download_url = f"/{OUTPUT_DIR}/{filename}"
-        logger.info("PDF generation completed: %s", output_path)
-
-        return {"success": True, "file_path": output_path, "download_url": download_url}
-    except RuntimeError as rte:
-        # our custom runtime errors (PDF creation)
-        logger.error("Runtime error while generating PDF: %s", rte)
-        raise HTTPException(status_code=500, detail=str(rte))
-    except Exception as exc:  # pragma: no cover - catch-all
-        logger.exception("Unexpected error in /generate-pdf")
-        raise HTTPException(status_code=500, detail="Unexpected server error") from exc
-
 
 @app.get("/")
 async def root():

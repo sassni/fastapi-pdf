@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 reportlab
 PyPDF2
+python-dotenv
